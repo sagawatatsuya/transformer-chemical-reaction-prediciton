@@ -50,8 +50,6 @@ def parse_args():
     parser.add_argument("--use_apex", action='store_true', default=False, required=False)
     parser.add_argument("--output_dir", type=str, default='./', required=False)
     parser.add_argument("--weight_decay", type=float, default=0.01, required=False)
-    parser.add_argument("--shuffle_augmentation", type=int, default=0, required=False)
-    parser.add_argument("--noncanonical_augmentation", type=int, default=0, required=False)
     parser.add_argument("--seed", type=int, default=42, required=False)
 
     return parser.parse_args()
@@ -98,73 +96,47 @@ def seed_everything(seed=42):
 seed_everything(seed=CFG.seed)  
     
 
-df = pd.read_csv(CFG.data_path)
-df = df[~df['YIELD'].isna()]
-for col in ['CATALYST', 'REACTANT', 'REAGENT', 'SOLVENT', 'INTERNAL_STANDARD', 'NoData','PRODUCT', 'YIELD', 'TEMP']:
+df = pd.read_csv(CFG.data_path).drop_duplicates().reset_index(drop=True)
+df = df[~df['YIELD'].isna()].reset_index(drop=True)
+df['YIELD'] = df['YIELD'].clip(0, 100)/100
+df = df[~(df['REACTANT'].isna() | df['PRODUCT'].isna())]
+for col in ['CATALYST', 'REACTANT', 'REAGENT', 'SOLVENT', 'INTERNAL_STANDARD', 'NoData','PRODUCT']:
     df[col] = df[col].fillna(' ')
-# df['input'] = 'REACTANT:' + df['REACTANT'] + 'PRODUCT:' + df['PRODUCT'] + 'CATALYST:' + df['CATALYST'] + 'REAGENT:' + df['REAGENT'] + 'SOLVENT:' + df['SOLVENT'] + 'NoData:' + df['NoData']
-df['input'] = 'REACTANT:' + df['REACTANT'] + 'PRODUCT:' + df['PRODUCT']
+    
+    
+###############################################
+def clean(row):
+    row = row.replace('. ', '').replace(' .', '').replace('  ', ' ')
+    return row
+df['REAGENT'] = df['CATALYST'] + '.' + df['REAGENT']
+df['REAGENT'] = df['REAGENT'].apply(lambda x: clean(x))
+
+from rdkit import Chem
+def canonicalize(mol):
+    mol = Chem.MolToSmiles(Chem.MolFromSmiles(mol),True)
+    return mol
+
+df['REAGENT'] = df['REAGENT'].apply(lambda x: canonicalize(x) if x != ' ' else ' ')
+###############################################
+    
+
+df['input'] = 'REACTANT:' + df['REACTANT']  + 'REAGENT:' + df['REAGENT'] + 'PRODUCT:' + df['PRODUCT']
+df = df[['input', 'YIELD']].drop_duplicates().reset_index(drop=True)
 
 lens = df['input'].apply(lambda x: len(x))
 # remove data that have too long inputs
-df = df[lens <= 512]
-# remove outlier
-print('len(df[df["YIELD"]>100]: ', len(df[df['YIELD']>100]))
-df = df[df['YIELD'] <= 100].reset_index(drop=True)
+df = df[lens <= 512].reset_index(drop=True)
+
 train_ds, test_ds = train_test_split(df, test_size=int(len(df)*0.1))
 train_ds, valid_ds = train_test_split(train_ds, test_size=int(len(df)*0.1))
 train_ds.to_csv('../../regression-input-train.csv', index=False)
 valid_ds.to_csv('../../regression-input-valid.csv', index=False)
 test_ds.to_csv('../../regression-input-test.csv', index=False)
 
-
 if CFG.debug:
     train_ds = train_ds[:int(len(train_ds)/4)].reset_index(drop=True)
     valid_ds = valid_ds[:int(len(valid_ds)/4)].reset_index(drop=True)
-    
-scaler = MinMaxScaler()
-train_ds['YIELD'] = scaler.fit_transform(train_ds['YIELD'].values.reshape(-1, 1))
-valid_ds['YIELD'] = scaler.transform(valid_ds['YIELD'].values.reshape(-1, 1))
-
-with open(OUTPUT_DIR+'scaler.pkl', 'wb') as f:
-    pickle.dump(scaler, f)
-    
-if CFG.noncanonical_augmentation:
-    from rdkit import Chem, RDLogger
-    RDLogger.DisableLog('rdApp.*')
-    def randomize(smiles):
-        lis = []
-        if (len(smiles) == 1) and smiles[0] == ' ':
-            return ' '
-        for smile in smiles:
-            mol = Chem.MolFromSmiles(smile)
-            smi = Chem.MolToSmiles(mol, doRandom=True)
-            lis.append(smi)
-        return '.'.join(lis)
-    
-    train_ds['split_reactant'] = train_ds['REACTANT'].apply(lambda x: x.split('.'))
-    dfs = [train_ds]
-    for i in range(CFG.noncanonical_augmentation):
-        dfc = train_ds.copy()
-        dfc['REACTANT'] = dfc['split_reactant'].apply(randomize)
-        dfs.append(dfc)
-    train_ds = pd.concat(dfs, axis=0).drop('split_reactant', axis=1).drop_duplicates().reset_index(drop=True)
-
-if CFG.shuffle_augmentation:
-    train_ds['split_reactant'] = train_ds['REACTANT'].apply(lambda x: x.split('.'))
-    dfs = [train_ds]
-    for i in range(CFG.shuffle_augmentation):
-        dfc = train_ds.copy()
-        dfc['REACTANT'] = dfc['split_reactant'].apply(lambda x: '.'.join(random.sample(x, len(x))))
-        dfs.append(dfc)
-    train_ds = pd.concat(dfs, axis=0).drop('split_reactant', axis=1).drop_duplicates().reset_index(drop=True)
-
-    
-if CFG.shuffle_augmentation or CFG.noncanonical_augmentation:
-    train_ds['input'] = 'REACTANT:' + train_ds['REACTANT'] + 'PRODUCT:' + train_ds['PRODUCT'] + 'CATALYST:' + train_ds['CATALYST']
-
-train_ds = train_ds[['input', 'YIELD']]
-valid_ds = valid_ds[['input', 'YIELD']]
+        
     
 def get_logger(filename=OUTPUT_DIR+'train'):
     from logging import getLogger, INFO, StreamHandler, FileHandler, Formatter
@@ -186,8 +158,8 @@ try: # load pretrained tokenizer from local directory
 except: # load pretrained tokenizer from huggingface model hub
     tokenizer = AutoTokenizer.from_pretrained(CFG.pretrained_model_name_or_path, return_tensors='pt')
 tokenizer.add_tokens('.')
-# tokenizer.add_special_tokens({'additional_special_tokens': tokenizer.additional_special_tokens + ['CATALYST:', 'REACTANT:', 'REAGENT:', 'SOLVENT:', 'NoData:','PRODUCT:']})
-tokenizer.add_special_tokens({'additional_special_tokens': tokenizer.additional_special_tokens + ['REACTANT:', 'PRODUCT:', 'NoData:']})
+
+tokenizer.add_special_tokens({'additional_special_tokens': tokenizer.additional_special_tokens + ['REACTANT:', 'PRODUCT:', 'REAGENT:']})
 tokenizer.save_pretrained(OUTPUT_DIR+'tokenizer/')
 CFG.tokenizer = tokenizer
 def prepare_input(cfg, text):
@@ -328,16 +300,10 @@ def valid_fn(valid_loader, model, criterion, device):
     for step, (inputs, labels) in enumerate(valid_loader):
         for k, v in inputs.items():
             inputs[k] = v.to(device)
-#         labels = labels.to(device)
-#         batch_size = labels.size(0)
         with torch.no_grad():
             y_preds = model(inputs)
         label_list += labels.tolist()
         pred_list += y_preds.tolist()
-#         loss = criterion(y_preds.view(-1, 1), labels.view(-1, 1))
-#         if CFG.gradient_accumulation_steps > 1:
-#             loss = loss/CFG.gradient_accumulation_steps
-#         losses.update(loss.item(), batch_size)
         end = time.time()
         if step % CFG.print_freq == 0 or step == (len(valid_loader)-1):
             print('EVAL: [{0}/{1}] '
@@ -396,6 +362,7 @@ def train_loop(train_ds, valid_ds):
     
     criterion = nn.MSELoss(reduction='mean')
     best_loss = float('inf')
+    es_count = 0
     
     for epoch in range(CFG.epochs):
         start_time = time.time()
@@ -408,9 +375,16 @@ def train_loop(train_ds, valid_ds):
         LOGGER.info(f'Epoch {epoch+1} - avg_train_loss: {avg_loss:.4f}  val_rmse_loss: {val_loss:.4f}  val_r2_score: {val_r2_score:.4f}  time: {elapsed:.0f}s')
     
         if val_loss < best_loss:
+            es_count = 0
             best_loss = val_loss
             LOGGER.info(f'Epoch {epoch+1} - Save Lowest Loss: {best_loss:.4f} Model')
             torch.save(model.state_dict(), OUTPUT_DIR+f"{CFG.pretrained_model_name_or_path.split('/')[-1]}_best.pth")
+            
+        else:
+            es_count += 1
+            if es_count >= 5:
+                print('early_stopping')
+                break
     
     torch.cuda.empty_cache()
     gc.collect()

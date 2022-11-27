@@ -7,12 +7,13 @@ import torch
 import tokenizers
 from transformers import AutoTokenizer, AutoModel, AutoConfig, EncoderDecoderModel, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
 import datasets
-from datasets import load_dataset, load_metric
+from datasets import load_dataset, load_metric, Dataset, DatasetDict
 import sentencepiece
 import argparse
 import optuna
 from transformers.trainer_utils import HPSearchBackend, default_hp_space, PREFIX_CHECKPOINT_DIR, default_compute_objective, BestRun
 import gc
+from sklearn.model_selection import train_test_split
 from datasets.utils.logging import disable_progress_bar
 disable_progress_bar()
 
@@ -33,9 +34,6 @@ def parse_args():
     parser.add_argument("--evaluation_strategy", type=str, default="epoch", required=False)
     parser.add_argument("--logging_strategy", type=str, default="epoch", required=False)
     parser.add_argument("--fp16", action='store_true', default=False, required=False)
-    parser.add_argument("--multitask", action="store_true", default=False, required=False)
-    parser.add_argument("--shuffle_augmentation", type=int, default=0, required=False)
-    parser.add_argument("--noncanonical_augmentation", type=int, default=0, required=False)
     parser.add_argument("--seed", type=int, default=42, required=False)
     parser.add_argument("--local_rank", type=int, default=0)
 
@@ -100,137 +98,38 @@ def hyperparameter_search(trainer, n_trials, hp_space = None, compute_objective 
     trainer.hp_search_backend = None
     return best_run
 
-   
-# if CFG.dataset_name:
-#     if CFG.debug:
-#         dataset = load_dataset(CFG.dataset_name)
-#         dataset['train'] = datasets.Dataset.from_dict(dataset["train"][:100])
-#         dataset['validation'] = datasets.Dataset.from_dict(dataset["validation"][:100])
-#         n_trials = 3
-#     else:
-#         dataset = load_dataset(CFG.dataset_name)
-#         n_trials = CFG.n_trials
-# else:
-#     if CFG.debug:
-#         train = pd.read_csv(CFG.data_path + 'all_ord_reaction_uniq_canonicalized-train.csv')[:100]
-#         test = pd.read_csv(CFG.data_path + 'all_ord_reaction_uniq_canonicalized-valid.csv')[:100]
-#         train.to_csv(CFG.data_path + 'ord-train-debug.csv', index=False)
-#         test.to_csv(CFG.data_path + 'ord-test-debug.csv', index=False)
-#         data_files = {'train': CFG.data_path + 'ord-train-debug.csv', 'validation': CFG.data_path + 'ord-test-debug.csv'}
-#         dataset = load_dataset('csv', data_files=data_files)
-#         n_trials = 3
-#     else:
-#         train = pd.read_csv(CFG.data_path + 'all_ord_reaction_uniq_canonicalized-train.csv')
-#         test = pd.read_csv(CFG.data_path + 'all_ord_reaction_uniq_canonicalized-valid.csv')
-#         data_files = {'train': CFG.data_path + 'all_ord_reaction_uniq_canonicalized-train.csv', 'validation': CFG.data_path + 'all_ord_reaction_uniq_canonicalized-valid.csv'}
-#         dataset = load_dataset('csv', data_files=data_files)
-#         n_trials = CFG.n_trials
 
-# if CFG.shuffle_augmentation:
-#     dataset['train'].set_format(type='pandas')
-#     df = dataset['train'][:]
-#     df['split_reactant'] = df['reactant'].apply(lambda x: x.split('.'))
-#     dfs = [df[['product', 'reactant']]]
-#     for i in range(CFG.shuffle_augmentation):
-#         df[f'shuffled_reactant{i}'] = df['split_reactant'].apply(lambda x: '.'.join(random.sample(x, len(x))))
-#         dfs.append(df[['product', f'shuffled_reactant{i}']].rename(columns={f'shuffled_reactant{i}': 'reactant'}))
-#     df = pd.concat(dfs, axis=0).drop_duplicates().reset_index(drop=True)
-#     dataset['train'] = datasets.Dataset.from_pandas(df)
-        
-# if CFG.noncanonical_augmentation:
-#     from rdkit import Chem, RDLogger
-#     RDLogger.DisableLog('rdApp.*')
-#     def randomize(smiles):
-#         lis = []
-#         for smile in smiles:
-#             mol = Chem.MolFromSmiles(smile)
-#             smi = Chem.MolToSmiles(mol, doRandom=True)
-#             lis.append(smi)
-#         return '.'.join(lis)
-    
-#     dataset['train'].set_format(type='pandas')
-#     df = dataset['train'][:]
-#     dfs = [df[['product', 'reactant']]]
-#     df['split_reactant'] =df['reactant'].apply(lambda x: x.split('.'))
-#     for i in range(CFG.noncanonical_augmentation):
-#         df[f'randomized_reactant{i}'] = df['split_reactant'].apply(randomize)
-#         dfs.append(df[['product', f'randomized_reactant{i}']].rename(columns={f'randomized_reactant{i}': 'reactant'}))
-#     df = pd.concat(dfs, axis=0).drop_duplicates().reset_index(drop=True)
-#     dataset['train'] = datasets.Dataset.from_pandas(df)
-        
-# if CFG.multitask:
-#     dataset['train'] = datasets.Dataset.from_dict({'product':['Reactants:'+i for i in dataset['train']['product']]+['Product:'+i for i in dataset['train']['reactant']], 'reactant': dataset['train']['reactant']+dataset['train']['product']})
-# else:
-#     dataset['train'] = datasets.Dataset.from_dict({'product':['Reactants:'+i for i in dataset['train']['product']], 'reactant': dataset['train']['reactant']})
-# dataset['validation'] = datasets.Dataset.from_dict({'product':['Reactants:'+i for i in dataset['validation']['product']], 'reactant': dataset['validation']['reactant']})
-# try:
-#     dataset['test'] = datasets.Dataset.from_dict({'product':['Reactants:'+i for i in dataset['test']['product']], 'reactant': dataset['test']['reactant']})
-# except:
-#     pass
-
-        
-df = pd.read_csv('../../all_ord_reaction_uniq_with_attr_v3.tsv')
+df = pd.read_csv(CFG.data_path)
 df = df[~df['PRODUCT'].isna()]
 for col in ['CATALYST', 'REACTANT', 'REAGENT', 'SOLVENT', 'INTERNAL_STANDARD', 'NoData','PRODUCT', 'YIELD', 'TEMP']:
     df[col] = df[col].fillna(' ')
-df['input'] = 'REACTANT:' + df['REACTANT'] + 'CATALYST:' + df['CATALYST'] + 'REAGENT:' + df['REAGENT'] + 'SOLVENT:' + df['SOLVENT'] + 'NoData:' + df['NoData']
+df['TEMP'] = df['TEMP'].apply(lambda x: str(x))
 
+
+# reactantとcatalyst========================================================================
+print(len(df), flush=True)
+df = df[df['REACTANT'] != ' ']
+print(len(df), flush=True)
+df = df[['REACTANT', 'PRODUCT', 'CATALYST', 'REAGENT', 'SOLVENT']].drop_duplicates().reset_index(drop=True)
+print(len(df), flush=True)
+df = df.iloc[df[['REACTANT', 'CATALYST', 'REAGENT', 'SOLVENT']].drop_duplicates().index].reset_index(drop=True)
+print(len(df), flush=True)
+df['input'] = 'REACTANT:' + df['REACTANT'] + 'CATALYST:' + df['CATALYST'] + 'REAGENT:' + df['REAGENT'] + 'SOLVENT:' + df['SOLVENT'] 
+# ========================================================================
 
 lens = df['input'].apply(lambda x: len(x))
 df = df[lens <= 512]
+
 train, test = train_test_split(df, test_size=int(len(df)*0.1))
 train, valid = train_test_split(train, test_size=int(len(df)*0.1))
-if CFG.debug:
-    train = train[:int(len(train)/100)].reset_index(drop=True)
-    valid = valid[:int(len(valid)/100)].reset_index(drop=True)
-    
-    
-if CFG.noncanonical_augmentation:
-    from rdkit import Chem, RDLogger
-    RDLogger.DisableLog('rdApp.*')
-    def randomize(smiles):
-        lis = []
-        if (len(smiles) == 1) and smiles[0] == ' ':
-            return ' '
-        for smile in smiles:
-            mol = Chem.MolFromSmiles(smile)
-            smi = Chem.MolToSmiles(mol, doRandom=True)
-            lis.append(smi)
-        return '.'.join(lis)
-    
-    train['split_reactant'] = train['REACTANT'].apply(lambda x: x.split('.'))
-    dfs = [train]
-    for i in range(CFG.noncanonical_augmentation):
-        dfc = train.copy()
-        dfc['REACTANT'] = dfc['split_reactant'].apply(randomize)
-        dfs.append(dfc)
-    train = pd.concat(dfs, axis=0).drop('split_reactant', axis=1).drop_duplicates().reset_index(drop=True)
-    
-if CFG.shuffle_augmentation:
-    train['split_reactant'] = train['REACTANT'].apply(lambda x: x.split('.'))
-    dfs = [train]
-    for i in range(CFG.shuffle_augmentation):
-        dfc = train.copy()
-        dfc['REACTANT'] = dfc['split_reactant'].apply(lambda x: '.'.join(random.sample(x, len(x))))
-        dfs.append(dfc)
-    train = pd.concat(dfs, axis=0).drop('split_reactant', axis=1).drop_duplicates().reset_index(drop=True)
-    
-if CFG.shuffle_augmentation or CFG.noncanonical_augmentation:
-    train['input'] = 'REACTANT:' + train['REACTANT'] + 'CATALYST:' + train['CATALYST'] + 'REAGENT:' + train['REAGENT'] + 'SOLVENT:' + train['SOLVENT'] + 'NoData:' + train['NoData']    
-    
-    
-if CFG.multitask:
-    dfc = train.copy()
-    dfc['input'] = 'PRODUCT:' + dfc['PRODUCT'] + 'CATALYST:' + dfc['CATALYST'] + 'REAGENT:' + dfc['REAGENT'] + 'SOLVENT:' + dfc['SOLVENT'] + 'NoData:' + dfc['NoData']
-    dfc['PRODUCT'] = dfc['REACTANT']
-    train = pd.concat([train, dfc], axis=0)
-    del dfc
 
-train[['input', 'PRODUCT']].to_csv('../../multi-input-train.csv', index=False)
-valid[['input', 'PRODUCT']].to_csv('../../multi-input-valid.csv', index=False)
 
-data_files = {'train': '../../multi-input-train.csv', 'validation': '../../multi-input-valid.csv'}
-dataset = load_dataset('csv', data_files=data_files)
+train = train[:int(len(train)/400)].reset_index(drop=True)
+valid = valid[:int(len(valid)/40)].reset_index(drop=True)
+    
+
+dataset = DatasetDict({'train': Dataset.from_pandas(train[['input', 'PRODUCT']]), 'validation': Dataset.from_pandas(valid[['input', 'PRODUCT']])})
+
     
     
 
@@ -344,7 +243,7 @@ def hp_tuning(cfg):
     param = trainer.hyperparameter_search(
         direction='maximize',
         hp_space=my_hp_space,
-        n_trials=n_trials
+        n_trials=cfg.n_trials
     )
     with open('result.txt', 'w') as f:
         f.write(str(param))

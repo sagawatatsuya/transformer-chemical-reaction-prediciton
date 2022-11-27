@@ -12,7 +12,7 @@ import tokenizers
 import transformers
 from transformers import AutoTokenizer, EncoderDecoderModel, DataCollatorForSeq2Seq, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer
 import datasets
-from datasets import load_dataset, load_metric
+from datasets import load_dataset, load_metric, Dataset, DatasetDict
 import sentencepiece
 import argparse
 from sklearn.model_selection import train_test_split
@@ -38,8 +38,6 @@ def parse_args():
     parser.add_argument("--fp16", action='store_true', default=False, required=False)
     parser.add_argument("--disable_tqdm", action="store_true", default=False, required=False)
     parser.add_argument("--multitask", action="store_true", default=False, required=False)
-    parser.add_argument("--shuffle_augmentation", type=int, default=0, required=False)
-    parser.add_argument("--noncanonical_augmentation", type=int, default=0, required=False)
     parser.add_argument("--seed", type=int, default=42, required=False)
 
     return parser.parse_args()
@@ -82,13 +80,45 @@ seed_everything(seed=CFG.seed)
 
 
 
+# df = pd.read_csv(CFG.data_path)
+# df = df[df['NoData'].isna()]
+# df_nodata = pd.read_csv('../compound-classification/reconstructed.csv')
+# df = pd.concat([df, df_nodata]).reset_index(drop=True)
+# df = df[~df['PRODUCT'].isna()]
+# for col in ['CATALYST', 'REACTANT', 'REAGENT', 'SOLVENT', 'INTERNAL_STANDARD', 'NoData','PRODUCT', 'YIELD', 'TEMP']:
+#     df[col] = df[col].fillna(' ')
+# df['TEMP'] = df['TEMP'].apply(lambda x: str(x))
+
 df = pd.read_csv(CFG.data_path)
 df = df[~df['PRODUCT'].isna()]
 for col in ['CATALYST', 'REACTANT', 'REAGENT', 'SOLVENT', 'INTERNAL_STANDARD', 'NoData','PRODUCT', 'YIELD', 'TEMP']:
     df[col] = df[col].fillna(' ')
 df['TEMP'] = df['TEMP'].apply(lambda x: str(x))
-df['input'] = 'REACTANT:' + df['REACTANT'] + 'CATALYST:' + df['CATALYST'] + 'REAGENT:' + df['REAGENT'] + 'SOLVENT:' + df['SOLVENT'] + 'NoData:' + df['NoData']
 
+
+# reactantとcatalyst========================================================================
+print(len(df), flush=True)
+df = df[df['REACTANT'] != ' ']
+print(len(df), flush=True)
+df = df[['REACTANT', 'PRODUCT', 'CATALYST', 'REAGENT', 'SOLVENT']].drop_duplicates().reset_index(drop=True)
+print(len(df), flush=True)
+df = df.iloc[df[['REACTANT', 'CATALYST', 'REAGENT', 'SOLVENT']].drop_duplicates().index].reset_index(drop=True)
+print(len(df), flush=True)
+
+def clean(row):
+    row = row.replace('. ', '').replace(' .', '').replace('  ', ' ')
+    return row
+df['REAGENT'] = df['CATALYST'] + '.' + df['REAGENT'] + '.' + df['SOLVENT']
+df['REAGENT'] = df['REAGENT'].apply(lambda x: clean(x))
+from rdkit import Chem
+def canonicalize(mol):
+    mol = Chem.MolToSmiles(Chem.MolFromSmiles(mol),True)
+    return mol
+df['REAGENT'] = df['REAGENT'].apply(lambda x: canonicalize(x) if x != ' ' else ' ')
+
+
+df['input'] = 'REACTANT:' + df['REACTANT'] + 'REAGENT:' + df['REAGENT']
+# ========================================================================
 
 lens = df['input'].apply(lambda x: len(x))
 df = df[lens <= 512]
@@ -96,29 +126,26 @@ df = df[lens <= 512]
 train, test = train_test_split(df, test_size=int(len(df)*0.1))
 train, valid = train_test_split(train, test_size=int(len(df)*0.1))
 
-use = [False if i.startswith('REACTANT: CATALYST: REAGENT: SOLVENT: NoData:') else True for i in train['input']]
-print('sum(use): ', sum(use), 'len(use): ', len(use), flush=True)
-train = train[use]
-if CFG.debug:
-    train = train[:int(len(train)/4)].reset_index(drop=True)
-    valid = valid[:int(len(valid)/4)].reset_index(drop=True)
-    
-    
-if CFG.multitask:
-    dfc = train.copy()
-    dfc['input'] = 'PRODUCT:' + dfc['PRODUCT'] + 'CATALYST:' + dfc['CATALYST'] + 'REAGENT:' + dfc['REAGENT'] + 'SOLVENT:' + dfc['SOLVENT'] + 'NoData:' + dfc['NoData']
-    dfc['PRODUCT'] = dfc['REACTANT']
-    train = pd.concat([train, dfc], axis=0)
-    del dfc
 
+if CFG.debug:
+    train = train[:int(len(train)/400)].reset_index(drop=True)
+    print('len(train):', len(train), flush=True)
+    valid = valid[:int(len(valid)/40)].reset_index(drop=True)
     
     
 train[['input', 'PRODUCT']].to_csv('../../multi-input-train.csv', index=False)
 valid[['input', 'PRODUCT']].to_csv('../../multi-input-valid.csv', index=False)
-# test[['input', 'PRODUCT']].to_csv('../../multi-input-test.csv', index=False)
+test[['input', 'PRODUCT']].to_csv('../../multi-input-test.csv', index=False)
 
-data_files = {'train': '../../multi-input-train.csv', 'validation': '../../multi-input-valid.csv'}
-dataset = load_dataset('csv', data_files=data_files)
+nodata = pd.read_csv('/data2/sagawa/transformer-chemical-reaction-prediciton/compound-classification/reconstructed.csv')
+nodata = nodata[~nodata['REACTANT'].isna()]
+for col in ['REAGENT']:
+    nodata[col] = nodata[col].fillna(' ')
+nodata['input'] = 'REACTANT:' + nodata['REACTANT'] + 'REAGENT:' + nodata['REAGENT']
+train = pd.concat([train[['input', 'PRODUCT']], nodata[['input', 'PRODUCT']]]).reset_index(drop=True)
+
+
+dataset = DatasetDict({'train': Dataset.from_pandas(train[['input', 'PRODUCT']]), 'validation': Dataset.from_pandas(valid[['input', 'PRODUCT']])})
 
 
 def preprocess_function(examples):
@@ -153,7 +180,7 @@ try: # load pretrained tokenizer from local directory
 except: # load pretrained tokenizer from huggingface model hub
     tokenizer = AutoTokenizer.from_pretrained(CFG.pretrained_model_name_or_path, return_tensors='pt')
 tokenizer.add_tokens('.')
-tokenizer.add_special_tokens({'additional_special_tokens': tokenizer.additional_special_tokens + ['CATALYST:', 'REACTANT:', 'REAGENT:', 'SOLVENT:', 'NoData:','PRODUCT:']})
+tokenizer.add_special_tokens({'additional_special_tokens': tokenizer.additional_special_tokens + ['REACTANT:', 'REAGENT:']})
 
 
 #load model

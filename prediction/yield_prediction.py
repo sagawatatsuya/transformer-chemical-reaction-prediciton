@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="sagawa/ZINC-t5", required=False)
     parser.add_argument("--model", type=str, default="t5", required=False)
     parser.add_argument("--model_name_or_path", type=str, required=False)
-    parser.add_argument("--scaler_path", type=str, default="/data2/sagawa/tcrp-regression-model-archive/10-23-1st-new-metric-reactant-product", required=False)
+#     parser.add_argument("--scaler_path", type=str, default="/data2/sagawa/tcrp-regression-model-archive/10-23-1st-new-metric-reactant-product", required=False)
     parser.add_argument("--debug", action='store_true', default=False, required=False)
     parser.add_argument("--max_len", type=int, default=512, required=False)
     parser.add_argument("--batch_size", type=int, default=5, required=False)
@@ -63,8 +63,8 @@ def seed_everything(seed=42):
 seed_everything(seed=CFG.seed)  
 
 
-with open(CFG.scaler_path + '/scaler.pkl', 'rb') as f:
-    scaler = pickle.load(f)
+# with open(CFG.scaler_path + '/scaler.pkl', 'rb') as f:
+#     scaler = pickle.load(f)
 
     
 
@@ -161,8 +161,9 @@ if 'csv' in CFG.data:
 
     prediction = inference_fn(test_loader, model, device)
 
-    test_ds['prediction'] = prediction
-    test_ds['prediction'] = scaler.inverse_transform(test_ds['prediction'].values.reshape(-1, 1))
+    test_ds['prediction'] = prediction*100
+    test_ds['prediction'] = test_ds['prediction'].clip(0, 100)
+#     test_ds['prediction'] = scaler.inverse_transform(test_ds['prediction'].values.reshape(-1, 1))
     test_ds.to_csv(CFG.output_dir + 'yield_prediction_output.csv', index=False)
     
 else:
@@ -176,5 +177,6 @@ else:
 
 
     prediction = inference_fn(test_loader, model, device)
-    print('yiled: ', scaler.inverse_transform(np.array(prediction[0]).reshape(1, -1))[0][0])
+    prediction = max(min(prediction[0][0]*100, 100), 0)
+    print('yiled: ', prediction)
  
